@@ -55,6 +55,7 @@ import (
 
 const (
 	defaultPort    = 1443
+	youtubePort    = 8080
 	tcpNodelay     = true
 	defaultRecvBuf = 256 * 1024
 	defaultSendBuf = 256 * 1024
