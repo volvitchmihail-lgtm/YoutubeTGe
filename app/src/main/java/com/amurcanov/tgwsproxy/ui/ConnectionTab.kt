@@ -171,7 +171,7 @@ fun ConnectionTab(settingsStore: SettingsStore) {
                     verticalArrangement = Arrangement.spacedBy(12.dp)
                 ) {
                     Image(
-                        painter = painterResource(id = R.drawable.ic_telegram_logo),
+                        painter = painterResource(id = R.mipmap.ic_launcher),
                         contentDescription = null,
                         modifier = Modifier
                             .size(180.dp)
