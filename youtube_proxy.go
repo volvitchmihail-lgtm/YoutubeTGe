@@ -1,21 +1,3 @@
-// ============================================================
-// ПАТЧ: youtube_proxy.go
-// Добавить этот файл в корень проекта рядом с tg-ws-proxy.go
-//
-// Что делает:
-//   - Перехватывает SOCKS5-запросы к YouTube/Google доменам
-//   - Туннелирует их через тот же WSS-мост что и Telegram
-//   - Mini App WebView в Telegram использует этот же SOCKS5
-//     если прокси настроен через PAC или системный прокси Android
-//
-// Архитектура:
-//   WebView (Mini App)
-//     └─► SOCKS5 127.0.0.1:1080
-//           ├─► Telegram IP  → WSS → Telegram DC   (оригинал)
-//           ├─► YouTube/Google → WSS → youtube.com  (новое)
-//           └─► Всё остальное → прямое соединение   (passthrough)
-// ============================================================
-
 package main
 
 import (
@@ -24,11 +6,10 @@ import (
 	"io"
 	"net"
 	"strings"
-	"sync"
 	"time"
 )
 
-// ─── Домены которые туннелируем через WSS ────────────────────────────────────
+// ─── YouTube домены ───────────────────────────────────────────────────────────
 
 var youtubeDomains = []string{
 	"youtube.com",
@@ -36,18 +17,15 @@ var youtubeDomains = []string{
 	"m.youtube.com",
 	"youtu.be",
 	"youtubei.googleapis.com",
-	"www.googleapis.com",
-	"googleapis.com",
-	"googlevideo.com",         // CDN видео
-	"yt3.ggpht.com",           // превью/аватарки
-	"i.ytimg.com",             // превью видео
-	"s.ytimg.com",             // статика YouTube
-	"accounts.google.com",     // вход в аккаунт
+	"googlevideo.com",
+	"yt3.ggpht.com",
+	"i.ytimg.com",
+	"s.ytimg.com",
+	"accounts.google.com",
 	"myaccount.google.com",
 }
 
 func isYouTubeDomain(host string) bool {
-	// Убираем порт если есть
 	h := host
 	if idx := strings.LastIndex(h, ":"); idx >= 0 {
 		h = h[:idx]
@@ -61,121 +39,208 @@ func isYouTubeDomain(host string) bool {
 	return false
 }
 
-// ─── Пул WSS-соединений для YouTube ─────────────────────────────────────────
-// Используем тот же Cloudflare WSS-мост что и для Telegram,
-// но открываем к нему обычный HTTPS CONNECT туннель.
+// ─── SOCKS5 listener для YouTube ─────────────────────────────────────────────
 
-type ytWsPool struct {
-	mu    sync.Mutex
-	conns []*RawWebSocket
-}
-
-var globalYtPool = &ytWsPool{}
-
-func (p *ytWsPool) get(cfDomain string) (*RawWebSocket, error) {
-	p.mu.Lock()
-	if len(p.conns) > 0 {
-		ws := p.conns[len(p.conns)-1]
-		p.conns = p.conns[:len(p.conns)-1]
-		p.mu.Unlock()
-		if !ws.closed.Load() {
-			return ws, nil
-		}
-	}
-	p.mu.Unlock()
-
-	// Берём активный CF-домен из основного прокси
-	cfproxyMu.RLock()
-	domain := activeCfDomain
-	cfproxyMu.RUnlock()
-	if cfDomain != "" {
-		domain = cfDomain
-	}
-	if domain == "" {
-		return nil, fmt.Errorf("нет активного CF-домена")
-	}
-
-	ws, err := wsConnect(domain, domain, "/apiws", 10.0)
+func startYouTubeSocks5(ctx context.Context, port int) {
+	addr := fmt.Sprintf("127.0.0.1:%d", port)
+	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return nil, fmt.Errorf("WSS connect failed: %w", err)
-	}
-	return ws, nil
-}
-
-func (p *ytWsPool) put(ws *RawWebSocket) {
-	if ws.closed.Load() {
+		logError.Printf("[YT-SOCKS5] Не удалось запустить: %v", err)
 		return
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if len(p.conns) < 4 {
-		p.conns = append(p.conns, ws)
-	} else {
-		ws.Close()
-	}
+	logInfo.Printf("[YT-SOCKS5] Слушаю на %s", addr)
+
+	go func() {
+		<-ctx.Done()
+		ln.Close()
+	}()
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					continue
+				}
+			}
+			go handleYtSocks5(ctx, conn)
+		}
+	}()
 }
 
-// ─── CONNECT туннель через WSS ───────────────────────────────────────────────
-// Протокол: отправляем "CONNECT host:port HTTP/1.1\r\n\r\n" через WSS-фрейм,
-// получаем "HTTP/1.1 200 OK\r\n\r\n", затем туннелируем TLS напрямую.
+// ─── Обработка SOCKS5 соединения ─────────────────────────────────────────────
 
-func handleYouTubeViaSocks(clientConn net.Conn, targetHost string, targetPort int) {
-	defer clientConn.Close()
+func handleYtSocks5(ctx context.Context, conn net.Conn) {
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
 
-	cfproxyMu.RLock()
-	domain := activeCfDomain
-	cfproxyMu.RUnlock()
+	buf := make([]byte, 256)
 
-	// Попытка соединения (до 3 раз)
-	var ws *RawWebSocket
-	var err error
-	for attempt := 0; attempt < 3; attempt++ {
-		ws, err = globalYtPool.get(domain)
-		if err == nil {
-			break
-		}
-		logWarn.Printf("[YT] WSS attempt %d failed: %v", attempt+1, err)
-		time.Sleep(500 * time.Millisecond)
+	// Шаг 1: читаем приветствие
+	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
+		return
 	}
-	if err != nil {
-		logError.Printf("[YT] Не удалось открыть WSS для %s: %v", targetHost, err)
-		// Fallback: прямое TCP соединение
-		handleYouTubeDirect(clientConn, targetHost, targetPort)
+	if buf[0] != 0x05 {
+		return
+	}
+	nMethods := int(buf[1])
+	if _, err := io.ReadFull(conn, buf[:nMethods]); err != nil {
+		return
+	}
+	// Без аутентификации
+	conn.Write([]byte{0x05, 0x00})
+
+	// Шаг 2: читаем запрос
+	if _, err := io.ReadFull(conn, buf[:4]); err != nil {
+		return
+	}
+	if buf[0] != 0x05 || buf[1] != 0x01 {
+		conn.Write([]byte{0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
 		return
 	}
 
-	// Отправляем CONNECT запрос через WebSocket фрейм
+	var host string
+	var port int
+
+	switch buf[3] {
+	case 0x01: // IPv4
+		if _, err := io.ReadFull(conn, buf[:4]); err != nil {
+			return
+		}
+		host = net.IP(buf[:4]).String()
+	case 0x03: // домен
+		if _, err := io.ReadFull(conn, buf[:1]); err != nil {
+			return
+		}
+		nameLen := int(buf[0])
+		if _, err := io.ReadFull(conn, buf[:nameLen]); err != nil {
+			return
+		}
+		host = string(buf[:nameLen])
+	case 0x04: // IPv6
+		if _, err := io.ReadFull(conn, buf[:16]); err != nil {
+			return
+		}
+		host = net.IP(buf[:16]).String()
+	default:
+		conn.Write([]byte{0x05, 0x08, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+
+	if _, err := io.ReadFull(conn, buf[:2]); err != nil {
+		return
+	}
+	port = int(buf[0])<<8 | int(buf[1])
+
+	if !isYouTubeDomain(host) {
+		handleYtDirectTunnel(conn, host, port)
+		return
+	}
+
+	logInfo.Printf("[YT-SOCKS5] %s:%d → WSS туннель", host, port)
+	handleYouTubeWSSTunnel(ctx, conn, host, port)
+}
+
+// ─── Прямой TCP туннель (не-YouTube домены) ───────────────────────────────────
+
+func handleYtDirectTunnel(clientConn net.Conn, host string, port int) {
+	addr := fmt.Sprintf("%s:%d", host, port)
+	remote, err := net.DialTimeout("tcp", addr, 10*time.Second)
+	if err != nil {
+		clientConn.Write([]byte{0x05, 0x04, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+		return
+	}
+	defer remote.Close()
+	setSockOpts(remote)
+
+	clientConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	_ = clientConn.SetDeadline(time.Time{})
+
+	done := make(chan struct{}, 2)
+	pipe := func(dst, src net.Conn) {
+		buf := make([]byte, 32*1024)
+		for {
+			n, err := src.Read(buf)
+			if n > 0 {
+				dst.Write(buf[:n])
+			}
+			if err != nil {
+				break
+			}
+		}
+		done <- struct{}{}
+	}
+	go pipe(remote, clientConn)
+	go pipe(clientConn, remote)
+	<-done
+}
+
+// ─── YouTube через WSS туннель ────────────────────────────────────────────────
+
+func handleYouTubeWSSTunnel(ctx context.Context, clientConn net.Conn, host string, port int) {
+	cfproxyMu.RLock()
+	cfDomain := activeCfDomain
+	domains := make([]string, len(cfproxyDomains))
+	copy(domains, cfproxyDomains)
+	cfproxyMu.RUnlock()
+
+	if cfDomain == "" && len(domains) > 0 {
+		cfDomain = domains[0]
+	}
+	if cfDomain == "" {
+		logWarn.Printf("[YT-SOCKS5] Нет CF-домена, прямое соединение")
+		handleYtDirectTunnel(clientConn, host, port)
+		return
+	}
+
+	// Подключаемся к CF через WSS (ctx, ip, domain, path, timeout)
+	ws, err := wsConnect(ctx, cfDomain, cfDomain, "/apiws", 10.0)
+	if err != nil {
+		for _, d := range domains {
+			if d == cfDomain {
+				continue
+			}
+			ws, err = wsConnect(ctx, d, d, "/apiws", 10.0)
+			if err == nil {
+				cfDomain = d
+				break
+			}
+		}
+		if err != nil {
+			logError.Printf("[YT-SOCKS5] WSS недоступен: %v — прямое соединение", err)
+			handleYtDirectTunnel(clientConn, host, port)
+			return
+		}
+	}
+
+	// HTTP CONNECT через WSS фрейм
 	connectReq := fmt.Sprintf("CONNECT %s:%d HTTP/1.1\r\nHost: %s:%d\r\n\r\n",
-		targetHost, targetPort, targetHost, targetPort)
-
-	if err = ws.Send([]byte(connectReq)); err != nil {
-		logError.Printf("[YT] CONNECT send failed: %v", err)
+		host, port, host, port)
+	if err := ws.Send([]byte(connectReq)); err != nil {
 		ws.Close()
-		handleYouTubeDirect(clientConn, targetHost, targetPort)
+		handleYtDirectTunnel(clientConn, host, port)
 		return
 	}
 
-	// Читаем ответ
 	resp, err := ws.Recv()
-	if err != nil {
-		logError.Printf("[YT] CONNECT recv failed: %v", err)
+	if err != nil || !strings.Contains(string(resp), "200") {
+		logWarn.Printf("[YT-SOCKS5] CF CONNECT отклонён: %s", strings.TrimSpace(string(resp)))
 		ws.Close()
-		handleYouTubeDirect(clientConn, targetHost, targetPort)
+		handleYtDirectTunnel(clientConn, host, port)
 		return
 	}
 
-	respStr := string(resp)
-	if !strings.Contains(respStr, "200") {
-		logWarn.Printf("[YT] CONNECT rejected: %s", strings.TrimSpace(respStr))
-		ws.Close()
-		handleYouTubeDirect(clientConn, targetHost, targetPort)
-		return
-	}
+	// Сообщаем клиенту успех
+	clientConn.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0})
+	_ = clientConn.SetDeadline(time.Time{})
 
-	logInfo.Printf("[YT] туннель открыт: %s:%d", targetHost, targetPort)
+	logInfo.Printf("[YT-SOCKS5] туннель открыт: %s:%d через %s", host, port, cfDomain)
 
-	// Теперь туннелируем данные между clientConn и WebSocket
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx2, cancel := context.WithCancel(ctx)
+	defer cancel()
 
 	// clientConn → WebSocket
 	go func() {
@@ -185,7 +250,6 @@ func handleYouTubeViaSocks(clientConn net.Conn, targetHost string, targetPort in
 			n, err := clientConn.Read(buf)
 			if n > 0 {
 				if sendErr := ws.Send(buf[:n]); sendErr != nil {
-					logDebug.Printf("[YT] ws send err: %v", sendErr)
 					return
 				}
 				stats.bytesUp.Add(int64(n))
@@ -202,11 +266,10 @@ func handleYouTubeViaSocks(clientConn net.Conn, targetHost string, targetPort in
 		for {
 			data, err := ws.Recv()
 			if err != nil {
-				logDebug.Printf("[YT] ws recv err: %v", err)
 				return
 			}
 			if len(data) > 0 {
-				if _, writeErr := clientConn.Write(data); writeErr != nil {
+				if _, werr := clientConn.Write(data); werr != nil {
 					return
 				}
 				stats.bytesDown.Add(int64(len(data)))
@@ -214,84 +277,6 @@ func handleYouTubeViaSocks(clientConn net.Conn, targetHost string, targetPort in
 		}
 	}()
 
-	// Ждём завершения
-	<-ctx.Done()
-	globalYtPool.put(ws)
-}
-
-// ─── Прямое соединение (fallback если WSS недоступен) ────────────────────────
-
-func handleYouTubeDirect(clientConn net.Conn, targetHost string, targetPort int) {
-	logInfo.Printf("[YT] fallback прямое соединение: %s:%d", targetHost, targetPort)
-
-	addr := fmt.Sprintf("%s:%d", targetHost, targetPort)
-	remoteConn, err := net.DialTimeout("tcp", addr, 10*time.Second)
-	if err != nil {
-		logError.Printf("[YT] direct dial failed: %v", err)
-		return
-	}
-	defer remoteConn.Close()
-	setSockOpts(remoteConn)
-
-	done := make(chan struct{}, 2)
-	copy := func(dst, src net.Conn) {
-		buf := make([]byte, 32*1024)
-		for {
-			n, err := src.Read(buf)
-			if n > 0 {
-				dst.Write(buf[:n])
-			}
-			if err != nil {
-				break
-			}
-		}
-		done <- struct{}{}
-	}
-
-	go copy(remoteConn, clientConn)
-	go copy(clientConn, remoteConn)
-	<-done
-}
-
-// ─── Точка входа: вызывается из основного SOCKS5-хэндлера ────────────────────
-// Добавь вызов этой функции в handleSocks5() в tg-ws-proxy.go
-// В месте где обрабатывается CONNECT (тип запроса 0x01, адрес домен или IP)
-
-func tryHandleYouTube(clientConn net.Conn, host string, port int) bool {
-	if !isYouTubeDomain(host) {
-		return false
-	}
-	// Отправляем SOCKS5 success response клиенту
-	// (0x05 0x00 0x00 0x01 + 4 байта IP + 2 байта порт)
-	socks5Success := []byte{0x05, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
-	clientConn.Write(socks5Success)
-
-	go handleYouTubeViaSocks(clientConn, host, port)
-	return true
-}
-
-// ─── Вспомогательная: io.Copy с подсчётом байт ───────────────────────────────
-
-func copyWithStats(dst io.Writer, src io.Reader, counter *int64) (int64, error) {
-	buf := make([]byte, 32*1024)
-	var total int64
-	for {
-		n, err := src.Read(buf)
-		if n > 0 {
-			written, werr := dst.Write(buf[:n])
-			total += int64(written)
-			if counter != nil {
-				(*counter) += int64(written)
-			}
-			if werr != nil {
-				return total, werr
-			}
-		}
-		if err != nil {
-			if err == io.EOF {
-				return total, nil
-			}
-			return total, err
-		}
-	}
+	<-ctx2.Done()
+	ws.Close()
 }
