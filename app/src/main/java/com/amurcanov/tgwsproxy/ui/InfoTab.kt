@@ -1167,7 +1167,7 @@ private fun DonateDialog(
                     onClick = { openUrlInBrowser(context, AndroidAppDonateUrl) }
                 ) {
                     Icon(
-                        painter = painterResource(id = R.drawable.ic_yoomoney),
+                        painter = painterResource(id = R.mipmap.ic_launcher),
                         contentDescription = "ЮMoney",
                         tint = Color.Unspecified,
                         modifier = Modifier
@@ -1184,7 +1184,7 @@ private fun DonateDialog(
                     onClick = { openUrlInBrowser(context, OriginalIdeaDonateUrl) }
                 ) {
                     Icon(
-                        painter = painterResource(id = R.drawable.ic_crypto_wordmark),
+                        painter = painterResource(id = R.mipmap.ic_launcher),
                         contentDescription = "Crypto",
                         tint = Color.Unspecified,
                         modifier = Modifier
