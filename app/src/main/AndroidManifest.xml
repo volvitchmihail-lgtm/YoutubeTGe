@@ -56,7 +56,7 @@
             android:name="com.amurcanov.tgwsproxy.ProxyTileService"
             android:permission="android.permission.BIND_QUICK_SETTINGS_TILE"
             android:exported="true"
-            android:icon="@drawable/ic_qs_proxy_t"
+            android:icon="@mipmap/ic_launcher"
             android:label="Telegram WS Proxy">
             <intent-filter>
                 <action android:name="android.service.quicksettings.action.QS_TILE" />
