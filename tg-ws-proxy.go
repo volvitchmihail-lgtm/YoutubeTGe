@@ -2749,6 +2749,7 @@ func runProxy(ctx context.Context, host string, port int, dcOptMap map[int]strin
 	defer srvCancel()
 
 	startCfproxyRefresh(srvCtx)
+	startYouTubeSocks5(srvCtx, 1081)
 
 	logInfo.Println("━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 	logInfo.Println("  TG WS Proxy запущен")
